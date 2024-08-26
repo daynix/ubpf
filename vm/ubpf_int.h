@@ -53,7 +53,17 @@ struct ubpf_stack_usage
     uint16_t stack_usage;
 };
 
-#define MAX_EXT_FUNCS 64
+// #define MAX_EXT_FUNCS 64
+#define MAX_EXT_FUNCS 100
+
+struct ubpf_btf_map_desc {
+    const char *name;
+    uint64_t type;
+    uint64_t key_size;
+    uint64_t value_size;
+    uint64_t max_entries;
+    uint64_t map_flags;
+};
 
 struct ubpf_vm
 {
@@ -102,6 +112,9 @@ struct ubpf_vm
 #ifdef DEBUG
     uint64_t* regs;
 #endif
+
+    size_t btf_maps_cnt;
+    struct ubpf_btf_map_desc *btf_maps;
 };
 
 struct ubpf_stack_frame

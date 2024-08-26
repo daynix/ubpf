@@ -118,6 +118,9 @@ ubpf_create(void)
 
     vm->jitted_result.compile_result = UBPF_JIT_COMPILE_FAILURE;
     vm->jitter_buffer_size = DEFAULT_JITTER_BUFFER_SIZE;
+
+    vm->btf_maps = NULL;
+    vm->btf_maps_cnt = 0;
     return vm;
 }
 
@@ -125,6 +128,10 @@ void
 ubpf_destroy(struct ubpf_vm* vm)
 {
     ubpf_unload_code(vm);
+
+    if (vm->btf_maps)
+        free(vm->btf_maps);
+
     free(vm->int_funcs);
     free(vm->ext_funcs);
     free(vm->ext_func_names);

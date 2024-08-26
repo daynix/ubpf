@@ -44,3 +44,5 @@ endif()
 if (UBPF_ENABLE_LIBFUZZER)
   add_subdirectory("libfuzzer")
 endif()
+
+add_subdirectory("AutoTest")

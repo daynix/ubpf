@@ -30,6 +30,10 @@
 #include <inttypes.h>
 #include "ubpf_int.h"
 
+
+#include <ctype.h>
+#include <linux/btf.h>
+
 #if defined(UBPF_HAS_ELF_H)
 #if defined(UBPF_HAS_ELF_H_COMPAT)
 #include <libelf.h>
@@ -99,6 +103,202 @@ section_idx_from_name(const char** section_names, int length, const char* needle
         }
     }
     return -1;
+}
+
+// static const char *__btf_kind_str(__u16 kind)
+// {
+// 	switch (kind) {
+// 	case BTF_KIND_UNKN: return "void";
+// 	case BTF_KIND_INT: return "int";
+// 	case BTF_KIND_PTR: return "ptr";
+// 	case BTF_KIND_ARRAY: return "array";
+// 	case BTF_KIND_STRUCT: return "struct";
+// 	case BTF_KIND_UNION: return "union";
+// 	case BTF_KIND_ENUM: return "enum";
+// 	case BTF_KIND_FWD: return "fwd";
+// 	case BTF_KIND_TYPEDEF: return "typedef";
+// 	case BTF_KIND_VOLATILE: return "volatile";
+// 	case BTF_KIND_CONST: return "const";
+// 	case BTF_KIND_RESTRICT: return "restrict";
+// 	case BTF_KIND_FUNC: return "func";
+// 	case BTF_KIND_FUNC_PROTO: return "func_proto";
+// 	case BTF_KIND_VAR: return "var";
+// 	case BTF_KIND_DATASEC: return "datasec";
+// 	case BTF_KIND_FLOAT: return "float";
+// 	case BTF_KIND_DECL_TAG: return "decl_tag";
+// 	case BTF_KIND_TYPE_TAG: return "type_tag";
+// 	case BTF_KIND_ENUM64: return "enum64";
+// 	default: return "unknown";
+// 	}
+// }
+
+struct btf_type * ubpf_btf_get_type_by_idx_slow(struct btf_header *hdr, size_t idx) {
+    struct btf_type *type = (struct btf_type *)((char *)(hdr + 1) + hdr->type_off);
+    size_t type_offset = 0;
+
+    /* btf type for "void" */
+    if (!idx)
+        return NULL;
+
+    int i = 1;
+    for (; type_offset < hdr->type_len;) {
+        if (i == idx) {
+            return type;
+        }
+
+        if (BTF_INFO_KIND(type->info) == BTF_KIND_INT) {
+            type_offset += sizeof(uint32_t);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_ARRAY) {
+            type_offset += sizeof(struct btf_array);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_STRUCT || BTF_INFO_KIND(type->info) == BTF_KIND_UNION) {
+            type_offset += sizeof(struct btf_member) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_ENUM) {
+            type_offset += sizeof(struct btf_enum) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_FUNC_PROTO) {
+            type_offset += sizeof(struct btf_param) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_VAR) {
+            type_offset += sizeof(struct btf_var);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_DATASEC) {
+            type_offset += sizeof(struct btf_var_secinfo) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_DECL_TAG) {
+            type_offset += sizeof(struct btf_decl_tag);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_ENUM64) {
+            type_offset += sizeof(struct btf_enum64) * BTF_INFO_VLEN(type->info);
+        }
+
+        type_offset += sizeof(struct btf_type);
+        type = (struct btf_type *)(type_offset + (char *)(hdr + 1) + hdr->type_off);
+        ++i;
+    }
+
+    return NULL;
+}
+
+static inline bool ubpf_btf_type_is_mod(const struct btf_type *t)
+{
+	uint16_t kind = BTF_INFO_KIND(t->info);
+
+	return kind == BTF_KIND_VOLATILE ||
+	       kind == BTF_KIND_CONST ||
+	       kind == BTF_KIND_RESTRICT ||
+	       kind == BTF_KIND_TYPE_TAG ||
+           kind == BTF_KIND_TYPEDEF ||
+           kind == BTF_KIND_PTR;
+}
+
+struct btf_type *
+ubpf_btf_get_type_by_idx_without_mods_slow(struct btf_header *hdr, size_t idx)
+{
+	struct btf_type *t = ubpf_btf_get_type_by_idx_slow(hdr, idx);
+
+	for (;ubpf_btf_type_is_mod(t);) {
+		t = ubpf_btf_get_type_by_idx_slow(hdr, t->type);
+	}
+
+	return t;
+}
+
+static inline int ubpf_btf_get_map_member_value_from_array_size(struct btf_header *btf_hdr, struct btf_member *m) {
+    struct btf_type *t = ubpf_btf_get_type_by_idx_without_mods_slow(btf_hdr, m->type);
+    struct btf_array *arr = (struct btf_array *)(t + 1);
+
+    if (BTF_INFO_KIND(t->info) != BTF_KIND_ARRAY)
+        return -1;
+
+    return arr->nelems;
+}
+
+static int ubpf_parse_btf_map_desc_from_var(struct btf_header *btf_hdr, struct btf_type *type, struct ubpf_btf_map_desc *map)
+{
+    struct btf_type *map_desc_type = NULL;
+    const char *strs = (char *)(btf_hdr + 1) + btf_hdr->str_off;
+    int i = 0;
+
+    if (BTF_INFO_KIND(type->info) != BTF_KIND_VAR)
+        return -1;
+
+    map_desc_type = ubpf_btf_get_type_by_idx_slow(btf_hdr, type->type);
+
+    if (BTF_INFO_KIND(map_desc_type->info) != BTF_KIND_STRUCT)
+        return -2;
+
+    map->name = strs + type->name_off;
+    for(; i < BTF_INFO_VLEN(map_desc_type->info); ++i) {
+        struct btf_member *m = (struct btf_member *)(map_desc_type + 1) + i;
+        if (!strncmp("type", strs + m->name_off, 4)) {
+            int val = ubpf_btf_get_map_member_value_from_array_size(btf_hdr, m);
+            map->type = val;
+        } else if (!strncmp("key_size", strs + m->name_off, 8)) {
+            int val = ubpf_btf_get_map_member_value_from_array_size(btf_hdr, m);
+            map->key_size = val;
+        } else if (!strncmp("value_size", strs + m->name_off, 10)) {
+            int val = ubpf_btf_get_map_member_value_from_array_size(btf_hdr, m);
+            map->value_size = val;
+        } else if (!strncmp("max_entries", strs + m->name_off, 11)) {
+            int val = ubpf_btf_get_map_member_value_from_array_size(btf_hdr, m);
+            map->max_entries = val;
+        } else if (!strncmp("map_flags", strs + m->name_off, 9)) {
+            int val = ubpf_btf_get_map_member_value_from_array_size(btf_hdr, m);
+            map->map_flags = val;
+        }
+    }
+
+    return 0;
+}
+
+static int ubpf_parse_btf(struct ubpf_vm* vm, const Elf64_Shdr* btf_section, const char* btf_data, int btf_size, char** errmsg)
+{
+    struct btf_header *btf_hdr = (struct btf_header *)btf_data;
+    (void)btf_section;
+    (void)btf_size;
+    const char *strs = (char *)(btf_hdr + 1) + btf_hdr->str_off;
+    struct btf_type *type = (struct btf_type *)((char *)(btf_hdr + 1) + btf_hdr->type_off);
+    size_t type_offset = 0;
+    int i = 1;
+    for (; type_offset < btf_hdr->type_len;) {
+        ++i;
+
+        if (BTF_INFO_KIND(type->info) == BTF_KIND_INT) {
+            type_offset += sizeof(uint32_t);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_ARRAY) {
+            type_offset += sizeof(struct btf_array);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_STRUCT || BTF_INFO_KIND(type->info) == BTF_KIND_UNION) {
+            type_offset += sizeof(struct btf_member) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_ENUM) {
+            type_offset += sizeof(struct btf_enum) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_FUNC_PROTO) {
+            type_offset += sizeof(struct btf_param) * BTF_INFO_VLEN(type->info);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_VAR) {
+            type_offset += sizeof(struct btf_var);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_DATASEC) {
+            type_offset += sizeof(struct btf_var_secinfo) * BTF_INFO_VLEN(type->info);
+
+            /* Parse bpf map descriptions */
+            if (!strncmp(".maps", strs + type->name_off, 5)) {
+                vm->btf_maps_cnt = BTF_INFO_VLEN(type->info);
+                vm->btf_maps = calloc(vm->btf_maps_cnt, sizeof(struct ubpf_btf_map_desc));
+                if (!vm->btf_maps) {
+                    *errmsg = ubpf_error("could not allocate memory for storing information about BPF maps");
+                    return -1;
+                }
+                int j = 0;
+                for (; j < BTF_INFO_VLEN(type->info); ++j) {
+                    struct btf_var_secinfo* sec = (struct btf_var_secinfo*)(type + 1) + j;
+                    struct btf_type* var = ubpf_btf_get_type_by_idx_slow(btf_hdr, sec->type);
+                    ubpf_parse_btf_map_desc_from_var(btf_hdr, var, &vm->btf_maps[j]);
+                }
+            }
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_DECL_TAG) {
+            type_offset += sizeof(struct btf_decl_tag);
+        } else if (BTF_INFO_KIND(type->info) == BTF_KIND_ENUM64) {
+            type_offset += sizeof(struct btf_enum64) * BTF_INFO_VLEN(type->info);
+        }
+
+        type_offset += sizeof(struct btf_type);
+        type = (struct btf_type *)(type_offset + (char *)(btf_hdr + 1) + btf_hdr->type_off);
+    }
+
+    return 0;
 }
 
 int
@@ -306,6 +506,21 @@ ubpf_load_elf_ex(struct ubpf_vm* vm, const void* elf, size_t elf_size, const cha
         current_landing_spot += relocated_functions[i]->size;
     }
 
+    const Elf64_Shdr* btf_section = NULL;
+    const char* btf_data = NULL;
+    int btf_size = 0;
+    for (i = 0; i < section_count; i++) {
+        const Elf64_Shdr* shdr = sections[i].shdr;
+        if (shdr->sh_type == SHT_PROGBITS && !strncmp(".BTF", strtab_data + shdr->sh_name, 5)) {
+            btf_section = shdr;
+            btf_data = sections[i].data;
+            btf_size = sections[i].size;
+            break;
+        }
+    }
+
+    ubpf_parse_btf(vm, btf_section, btf_data, btf_size, errmsg);
+
     /* Process each relocation section */
     for (i = 0; i < section_count; i++) {
 
@@ -399,10 +614,10 @@ ubpf_load_elf_ex(struct ubpf_vm* vm, const void* elf, size_t elf_size, const cha
                     goto error;
                 }
                 section* map = &sections[relo_sym.st_shndx];
-                if (map->shdr->sh_type != SHT_PROGBITS || map->shdr->sh_flags != (SHF_ALLOC | SHF_WRITE)) {
-                    *errmsg = ubpf_error("bad R_BPF_64_64 relocation section");
-                    goto error;
-                }
+                // if (map->shdr->sh_type != SHT_PROGBITS || map->shdr->sh_flags != (SHF_ALLOC | SHF_WRITE)) {
+                //     *errmsg = ubpf_error("bad R_BPF_64_64 relocation section");
+                //     goto error;
+                // }
 
                 if (relo_sym.st_size + relo_sym.st_value > map->size) {
                     *errmsg = ubpf_error("bad R_BPF_64_64 size");
@@ -424,9 +639,18 @@ ubpf_load_elf_ex(struct ubpf_vm* vm, const void* elf, size_t elf_size, const cha
                     goto error;
                 }
 
+                struct ubpf_btf_map_desc *btf_map = NULL;
+                for (uint i = 0; i < vm->btf_maps_cnt; i++) {
+                    if (!strcmp(vm->btf_maps[i].name, relo_sym_name)) {
+                        btf_map = &vm->btf_maps[i];
+                        break;
+                    }
+                }
+
                 uint64_t imm = vm->data_relocation_function(
                     vm->data_relocation_user_data,
-                    map->data,
+                    /* TODO: change this hack or remove btf completely */
+                    btf_map ? btf_map : map->data,
                     map->size,
                     relo_sym_name,
                     relo_sym.st_value,
